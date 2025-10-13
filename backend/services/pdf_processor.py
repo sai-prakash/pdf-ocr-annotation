@@ -39,21 +39,24 @@ class PDFProcessor:
         with open(file_path, 'rb') as f:
             return hashlib.md5(f.read()).hexdigest()
 
-    def _is_page_scanned(self, page: fitz.Page) -> bool:
-        """Detect if a page is scanned (image-based) or has extractable text"""
+    def _should_run_ocr(self, page: fitz.Page) -> Tuple[bool, bool]:
+        """
+        Determine if page needs OCR and if it has native text.
+        Returns: (has_native_text, should_run_ocr)
+        """
         text = page.get_text().strip()
+        has_native_text = len(text) > 10  # Has some readable text
 
-        # If page has minimal text but contains images, it's likely scanned
-        if len(text) < 50:
-            image_list = page.get_images()
-            if len(image_list) > 0:
-                return True
+        # Check for images on the page
+        image_list = page.get_images()
+        has_images = len(image_list) > 0
 
-        # Check text to image ratio
-        if len(text) < 100:
-            return True
+        # Run OCR if:
+        # 1. Page has images (might contain text in images)
+        # 2. OR page has very little native text (< 50 chars)
+        should_run_ocr = has_images or len(text) < 50
 
-        return False
+        return has_native_text, should_run_ocr
 
     def _extract_text_pymupdf(self, page: fitz.Page) -> List[Dict]:
         """Extract text with bounding boxes using PyMuPDF"""
@@ -209,23 +212,40 @@ class PDFProcessor:
             page_start = time.time()
             page = doc[page_num]
 
-            # Detect if page is scanned
-            is_scanned = self._is_page_scanned(page)
-            page_type = "SCANNED" if is_scanned else "NATIVE"
+            # Determine extraction strategy
+            has_native_text, should_run_ocr = self._should_run_ocr(page)
+
+            # Determine page type for logging
+            if has_native_text and should_run_ocr:
+                page_type = "HYBRID (Native + OCR)"
+            elif should_run_ocr:
+                page_type = "SCANNED (OCR only)"
+            else:
+                page_type = "NATIVE (Text only)"
 
             logger.info(f"[PDF] Processing page {page_num + 1}/{total_pages} ({page_type})")
 
-            # Extract text based on page type
-            if is_scanned:
-                blocks = self._extract_text_ocr(page, page_num)
-            else:
-                blocks = self._extract_text_pymupdf(page)
+            blocks = []
+
+            # Extract native text if available
+            if has_native_text:
+                native_blocks = self._extract_text_pymupdf(page)
+                blocks.extend(native_blocks)
+                logger.info(f"[PDF] Page {page_num + 1}: Extracted {len(native_blocks)} native text blocks")
+
+            # Run OCR if needed (images present or insufficient native text)
+            if should_run_ocr:
+                ocr_blocks = self._extract_text_ocr(page, page_num)
+                blocks.extend(ocr_blocks)
+                logger.info(f"[PDF] Page {page_num + 1}: Extracted {len(ocr_blocks)} OCR text blocks")
 
             # Merge and organize text
             page_data = self._merge_text_blocks(blocks)
             page_data.update({
                 "page_number": page_num + 1,
-                "is_scanned": is_scanned,
+                "is_scanned": should_run_ocr and not has_native_text,  # True only if purely scanned
+                "has_native_text": has_native_text,
+                "has_ocr_text": should_run_ocr,
                 "width": page.rect.width,
                 "height": page.rect.height
             })
@@ -233,7 +253,7 @@ class PDFProcessor:
             pages_data.append(page_data)
 
             page_time = time.time() - page_start
-            logger.info(f"[PDF] Page {page_num + 1}/{total_pages} completed in {page_time:.2f}s ({len(blocks)} blocks)")
+            logger.info(f"[PDF] Page {page_num + 1}/{total_pages} completed in {page_time:.2f}s ({len(blocks)} total blocks)")
 
         total_time = time.time() - start_time
         logger.info(f"[PDF] Processing complete: {total_pages} pages in {total_time:.2f}s ({total_time/total_pages:.2f}s per page)")

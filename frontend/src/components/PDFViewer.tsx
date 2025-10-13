@@ -4,6 +4,8 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { usePdfStore } from '../store/pdfStore';
 import type { BoundingBox } from '../store/pdfStore';
+import { TextLayerOverlay } from './TextLayerOverlay';
+import { TextOnlyView } from './TextOnlyView';
 import './PDFViewer.css';
 import {
   SpatialIndex,
@@ -38,6 +40,7 @@ export const PDFViewer: React.FC = () => {
     fileUrl,
     currentPage,
     zoomLevel,
+    viewMode,
     pages,
     annotations,
     searchResults,
@@ -57,9 +60,14 @@ export const PDFViewer: React.FC = () => {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
 
   // Get current page data (must be defined before useMemo hooks that depend on it)
   const currentPageData = pages.find((p) => p.page_number === currentPage);
+
+  // Calculate effective scale (base fit * zoom level) - must be before useEffects that use it
+  const baseScale = pageWidth / (currentPageData?.width || 800);
+  const effectiveScale = baseScale * zoomLevel;
 
   // Create spatial index for performance (memoized)
   const spatialIndex = useMemo(() => {
@@ -79,6 +87,97 @@ export const PDFViewer: React.FC = () => {
     return () => window.removeEventListener('resize', updateWidth);
   }, []);
 
+  // Handle scroll to annotation event
+  useEffect(() => {
+    const handleScrollToAnnotation = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const { annotation } = customEvent.detail;
+
+      if (!canvasRef.current) return;
+
+      // Wait for page change to complete if needed
+      setTimeout(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        // Calculate annotation position
+        const y = annotation.bounding_box.y0 * effectiveScale;
+        const x = annotation.bounding_box.x0 * effectiveScale;
+
+        // Scroll canvas into view with the annotation centered
+        const canvasRect = canvas.getBoundingClientRect();
+        const containerRect = containerRef.current?.getBoundingClientRect();
+
+        if (containerRect) {
+          const scrollX = x - containerRect.width / 2;
+          const scrollY = y - containerRect.height / 2;
+
+          // Smooth scroll to the annotation
+          containerRef.current?.scrollTo({
+            top: scrollY,
+            left: scrollX,
+            behavior: 'smooth',
+          });
+        }
+      }, 100);
+    };
+
+    window.addEventListener('scrollToAnnotation', handleScrollToAnnotation);
+    return () => window.removeEventListener('scrollToAnnotation', handleScrollToAnnotation);
+  }, [effectiveScale]);
+
+  // Handle highlight annotation event (flashing effect)
+  const [flashingAnnotationId, setFlashingAnnotationId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleHighlightAnnotation = (event: Event) => {
+      const customEvent = event as CustomEvent;
+      const { annotationId } = customEvent.detail;
+
+      // Set the flashing annotation (this will trigger visual effect in canvas draw)
+      setFlashingAnnotationId(annotationId);
+    };
+
+    window.addEventListener('highlightAnnotation', handleHighlightAnnotation);
+    return () => window.removeEventListener('highlightAnnotation', handleHighlightAnnotation);
+  }, []);
+
+  // Close text selection popup on click outside or Escape key
+  useEffect(() => {
+    if (!textSelection) return;
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (popupRef.current && !popupRef.current.contains(event.target as Node)) {
+        // Clear browser selection when closing popup
+        const selection = window.getSelection();
+        if (selection) {
+          selection.removeAllRanges();
+        }
+        setTextSelection(null);
+      }
+    };
+
+    const handleEscapeKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        // Clear browser selection when closing popup
+        const selection = window.getSelection();
+        if (selection) {
+          selection.removeAllRanges();
+        }
+        setTextSelection(null);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleEscapeKey);
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscapeKey);
+    };
+  }, [textSelection]);
+
   const onDocumentLoadSuccess = () => {
     // Document loaded successfully
   };
@@ -86,10 +185,6 @@ export const PDFViewer: React.FC = () => {
   const onPageLoadSuccess = () => {
     // Page loaded successfully
   };
-
-  // Calculate effective scale (base fit * zoom level)
-  const baseScale = pageWidth / (currentPageData?.width || 800);
-  const effectiveScale = baseScale * zoomLevel;
 
   // Draw text blocks overlay for scanned pages
   useEffect(() => {
@@ -123,9 +218,31 @@ export const PDFViewer: React.FC = () => {
         const height = (ann.bounding_box.y1 - ann.bounding_box.y0) * effectiveScale;
 
         const isSelected = selectedAnnotation?.id === ann.id;
+        const isFlashing = flashingAnnotationId === ann.id;
 
-        // Highlight selected annotation with enhanced styling
-        if (isSelected) {
+        // Highlight flashing annotation (from click in annotation panel)
+        if (isFlashing) {
+          // Bright yellow flash effect
+          ctx.fillStyle = 'rgba(255, 215, 0, 0.6)';
+          ctx.fillRect(x - 6, y - 6, width + 12, height + 12);
+
+          // Inner highlight
+          ctx.fillStyle = 'rgba(255, 235, 59, 0.5)';
+          ctx.fillRect(x, y, width, height);
+
+          // Bold golden border
+          ctx.strokeStyle = '#ffd700';
+          ctx.lineWidth = 4;
+          ctx.strokeRect(x, y, width, height);
+
+          // Pulsing outer glow
+          ctx.strokeStyle = '#ffd700';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([8, 4]);
+          ctx.strokeRect(x - 4, y - 4, width + 8, height + 8);
+          ctx.setLineDash([]);
+        } else if (isSelected) {
+          // Highlight selected annotation with enhanced styling
           // Outer glow effect
           ctx.fillStyle = ann.color + '60'; // More opacity for selected
           ctx.fillRect(x - 4, y - 4, width + 8, height + 8);
@@ -252,8 +369,10 @@ export const PDFViewer: React.FC = () => {
       });
     }
 
-    // Draw current selection (after mouse up)
-    if (textSelection && textSelection.pageNumber === currentPage) {
+    // Draw current selection (after mouse up) - ONLY for canvas selections, not text layer
+    // Text layer selections show native browser highlight, don't need canvas highlight
+    if (textSelection && textSelection.pageNumber === currentPage && textSelection.stats) {
+      // Only draw if selection has stats (came from canvas selection, not text layer)
       const x = textSelection.bbox.x0 * effectiveScale;
       const y = textSelection.bbox.y0 * effectiveScale;
       const width = (textSelection.bbox.x1 - textSelection.bbox.x0) * effectiveScale;
@@ -266,7 +385,7 @@ export const PDFViewer: React.FC = () => {
       ctx.lineWidth = 3;
       ctx.strokeRect(x, y, width, height);
     }
-  }, [currentPageData, effectiveScale, annotations, searchResults, currentSearchIndex, selectedAnnotation, textSelection, currentPage, hoveredBlocks, isSelecting, selectionStart, currentMousePos, liveSelectedBlocks, zoomLevel]);
+  }, [currentPageData, effectiveScale, annotations, searchResults, currentSearchIndex, selectedAnnotation, textSelection, currentPage, hoveredBlocks, isSelecting, selectionStart, currentMousePos, liveSelectedBlocks, zoomLevel, flashingAnnotationId]);
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -415,6 +534,23 @@ export const PDFViewer: React.FC = () => {
       const maxX = Math.max(...sortedBlocks.map((b) => b.bbox.x1));
       const maxY = Math.max(...sortedBlocks.map((b) => b.bbox.y1));
 
+      // Validate bbox dimensions
+      const width = maxX - minX;
+      const height = maxY - minY;
+
+      // Reject unreasonably large bounding boxes (likely errors)
+      const maxReasonableWidth = 2000; // 2000 PDF units
+      const maxReasonableHeight = 3000; // 3000 PDF units
+
+      if (width > maxReasonableWidth || height > maxReasonableHeight) {
+        console.warn('Canvas selection: Rejected large bbox:', { width, height });
+        setIsSelecting(false);
+        setSelectionStart(null);
+        setLiveSelectedBlocks([]);
+        setPreviewText('');
+        return;
+      }
+
       // Get statistics
       const stats = getSelectionStats(sortedBlocks, combinedText);
 
@@ -440,6 +576,33 @@ export const PDFViewer: React.FC = () => {
     );
   }
 
+  // Handler for native text selection from TextLayerOverlay
+  const handleTextLayerSelection = (text: string, bbox: BoundingBox) => {
+    setTextSelection({
+      text,
+      bbox,
+      pageNumber: currentPage,
+    });
+  };
+
+  // Text-only view mode
+  if (viewMode === 'text-only') {
+    if (!currentPageData) {
+      return (
+        <div className="pdf-viewer-empty">
+          <p>Loading page data...</p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="pdf-viewer-container" ref={containerRef}>
+        <TextOnlyView pageData={currentPageData} currentPage={currentPage} />
+      </div>
+    );
+  }
+
+  // PDF view mode (with optional text layer overlay)
   return (
     <div className="pdf-viewer-container" ref={containerRef}>
       <div className="pdf-viewer-content">
@@ -453,9 +616,21 @@ export const PDFViewer: React.FC = () => {
               pageNumber={currentPage}
               width={pageWidth * zoomLevel}
               onLoadSuccess={onPageLoadSuccess}
-              renderTextLayer={!currentPageData?.is_scanned}
+              renderTextLayer={false}
               renderAnnotationLayer={false}
             />
+
+            {/* Invisible text layer for native browser selection */}
+            {currentPageData && currentPageData.blocks && (
+              <TextLayerOverlay
+                blocks={currentPageData.blocks}
+                scale={effectiveScale}
+                pageWidth={pageWidth * zoomLevel}
+                pageHeight={currentPageData.height * effectiveScale}
+                onTextSelect={handleTextLayerSelection}
+              />
+            )}
+
             <canvas
               ref={canvasRef}
               className="pdf-overlay-canvas"
@@ -471,7 +646,7 @@ export const PDFViewer: React.FC = () => {
                 top: 0,
                 left: 0,
                 cursor: isSelecting ? 'crosshair' : hoveredBlocks.length > 0 ? 'pointer' : 'text',
-                pointerEvents: 'all',
+                pointerEvents: isSelecting ? 'all' : 'none', // Allow text layer to handle selection when not actively selecting
               }}
             />
           </div>
@@ -497,15 +672,23 @@ export const PDFViewer: React.FC = () => {
         )}
 
         {textSelection && (
-          <div className="text-selection-popup">
-            <p>
-              <strong>Selected:</strong> {textSelection.text.substring(0, 100)}
-              {textSelection.text.length > 100 ? '...' : ''}
-            </p>
+          <div ref={popupRef} className="text-selection-popup">
+            <div className="popup-header">
+              <strong>Selected Text</strong>
+              {textSelection.stats && (
+                <div className="selection-stats-inline">
+                  <span>{textSelection.stats.wordCount} words</span>
+                  <span>•</span>
+                  <span>{textSelection.stats.charCount} chars</span>
+                </div>
+              )}
+            </div>
+            <div className="popup-text-content">
+              {textSelection.text}
+            </div>
             {textSelection.stats && (
               <div className="selection-stats">
-                <span>{textSelection.stats.wordCount} words</span>
-                <span>{textSelection.stats.charCount} characters</span>
+                <span>{textSelection.stats.blockCount} blocks</span>
                 <span>{Math.round(textSelection.stats.avgConfidence * 100)}% confidence</span>
               </div>
             )}
@@ -531,7 +714,19 @@ export const PDFViewer: React.FC = () => {
               >
                 Create Annotation
               </button>
-              <button onClick={() => setTextSelection(null)}>Cancel</button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // Clear browser selection when closing popup
+                  const selection = window.getSelection();
+                  if (selection) {
+                    selection.removeAllRanges();
+                  }
+                  setTextSelection(null);
+                }}
+              >
+                Cancel
+              </button>
             </div>
           </div>
         )}

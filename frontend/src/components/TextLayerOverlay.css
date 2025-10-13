@@ -1,0 +1,37 @@
+.text-layer-overlay {
+  z-index: 10;
+  /* Ensure text layer is above PDF but below canvas */
+}
+
+.text-block-overlay {
+  font-family: 'Arial', 'Helvetica', sans-serif;
+  pointer-events: auto;
+  /* Transparent text with visible selection */
+  color: transparent !important;
+  background: transparent;
+  /* Prevent any visual artifacts */
+  text-shadow: none;
+  -webkit-text-fill-color: transparent;
+  /* Ensure text is still selectable */
+  cursor: text;
+}
+
+/* Show blue selection highlight when text is selected */
+.text-block-overlay::selection {
+  background-color: rgba(33, 150, 243, 0.4);
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+.text-block-overlay::-moz-selection {
+  background-color: rgba(33, 150, 243, 0.4);
+  color: transparent;
+}
+
+/* Debug mode - uncomment to see text layer boundaries */
+/*
+.text-block-overlay {
+  border: 1px dashed rgba(255, 0, 0, 0.3);
+  background: rgba(0, 255, 0, 0.05);
+}
+*/

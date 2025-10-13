@@ -6,6 +6,8 @@ import {
   ChevronRight,
   ZoomIn,
   ZoomOut,
+  FileText,
+  Type,
 } from 'lucide-react';
 import { usePdfStore } from '../store/pdfStore';
 import { uploadPdf, searchPdf, getAnnotations } from '../services/api';
@@ -18,12 +20,14 @@ export const Toolbar: React.FC = () => {
     currentPage,
     totalPages,
     zoomLevel,
+    viewMode,
     searchResults,
     currentSearchIndex,
     setCurrentPage,
     zoomIn,
     zoomOut,
     resetZoom,
+    setViewMode,
     setPdfData,
     setAnnotations,
     setSearchResults,
@@ -227,6 +231,27 @@ export const Toolbar: React.FC = () => {
                 title="Zoom in (Ctrl++)"
               >
                 <ZoomIn size={18} />
+              </button>
+            </div>
+          </div>
+
+          <div className="toolbar-section">
+            <div className="view-mode-toggle">
+              <button
+                onClick={() => setViewMode('pdf')}
+                className={`view-mode-button ${viewMode === 'pdf' ? 'active' : ''}`}
+                title="PDF with text layer"
+              >
+                <FileText size={18} />
+                <span>PDF</span>
+              </button>
+              <button
+                onClick={() => setViewMode('text-only')}
+                className={`view-mode-button ${viewMode === 'text-only' ? 'active' : ''}`}
+                title="Text-only view"
+              >
+                <Type size={18} />
+                <span>Text</span>
               </button>
             </div>
           </div>

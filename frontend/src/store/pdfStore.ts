@@ -46,6 +46,8 @@ export interface SearchResult {
   match_index: number;
 }
 
+export type ViewMode = 'pdf' | 'text-only';
+
 interface PDFState {
   pdfId: string | null;
   filename: string | null;
@@ -53,6 +55,7 @@ interface PDFState {
   totalPages: number;
   currentPage: number;
   zoomLevel: number;
+  viewMode: ViewMode;
   pages: PageData[];
   annotations: Annotation[];
   searchResults: SearchResult[];
@@ -74,6 +77,7 @@ interface PDFState {
   zoomIn: () => void;
   zoomOut: () => void;
   resetZoom: () => void;
+  setViewMode: (mode: ViewMode) => void;
   setAnnotations: (annotations: Annotation[]) => void;
   addAnnotation: (annotation: Annotation) => void;
   updateAnnotation: (id: string, annotation: Partial<Annotation>) => void;
@@ -96,6 +100,7 @@ const initialState = {
   totalPages: 0,
   currentPage: 1,
   zoomLevel: 1,
+  viewMode: 'pdf' as ViewMode,
   pages: [],
   annotations: [],
   searchResults: [],
@@ -134,6 +139,8 @@ export const usePdfStore = create<PDFState>((set) => ({
     })),
 
   resetZoom: () => set({ zoomLevel: 1 }),
+
+  setViewMode: (mode) => set({ viewMode: mode }),
 
   setAnnotations: (annotations) => set({ annotations }),
 
