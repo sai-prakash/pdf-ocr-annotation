@@ -6,6 +6,8 @@ import { usePdfStore } from '../store/pdfStore';
 import type { BoundingBox } from '../store/pdfStore';
 import { TextLayerOverlay } from './TextLayerOverlay';
 import { TextOnlyView } from './TextOnlyView';
+import { SelectionToolbar } from './SelectionToolbar';
+import { AddTextModal } from './AddTextModal';
 import './PDFViewer.css';
 import {
   SpatialIndex,
@@ -19,6 +21,19 @@ import {
   type SelectionMode,
   type SelectionRect,
 } from '../utils/selectionUtils';
+import {
+  smartTextSelection,
+  filterTextBlocks,
+  getSelectionStatistics,
+} from '../utils/smartSelectionEngine';
+import {
+  pointInPolygon,
+  bboxIntersectsPolygon,
+  simplifyPath,
+  closePolygon,
+  getPolygonBounds,
+  type Point,
+} from '../utils/geometryUtils';
 
 // Set up PDF.js worker
 pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
@@ -57,6 +72,15 @@ export const PDFViewer: React.FC = () => {
   const [liveSelectedBlocks, setLiveSelectedBlocks] = useState<any[]>([]);
   const [selectionMode, setSelectionMode] = useState<SelectionMode>('word');
   const [previewText, setPreviewText] = useState<string>('');
+
+  // Freeform selection states
+  const [selectionTool, setSelectionTool] = useState<'rectangle' | 'lasso' | 'polygon' | 'add-text'>('rectangle');
+  const [lassoPath, setLassoPath] = useState<Point[]>([]);
+  const [polygonPoints, setPolygonPoints] = useState<Point[]>([]);
+
+  // Add text mode states
+  const [isAddTextModalOpen, setIsAddTextModalOpen] = useState(false);
+  const [addTextBbox, setAddTextBbox] = useState<BoundingBox | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -142,7 +166,56 @@ export const PDFViewer: React.FC = () => {
     return () => window.removeEventListener('highlightAnnotation', handleHighlightAnnotation);
   }, []);
 
-  // Close text selection popup on click outside or Escape key
+  // Keyboard shortcuts for tool switching
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Ignore if user is typing in an input
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      switch (event.key.toLowerCase()) {
+        case 'r':
+          setSelectionTool('rectangle');
+          setPolygonPoints([]);
+          setLassoPath([]);
+          break;
+        case 'l':
+          setSelectionTool('lasso');
+          setPolygonPoints([]);
+          break;
+        case 'p':
+          setSelectionTool('polygon');
+          setLassoPath([]);
+          break;
+        case 't':
+          setSelectionTool('add-text');
+          setPolygonPoints([]);
+          setLassoPath([]);
+          break;
+        case 'escape':
+          // Cancel current polygon/lasso or close popup
+          if (polygonPoints.length > 0) {
+            setPolygonPoints([]);
+          } else if (lassoPath.length > 0) {
+            setLassoPath([]);
+          } else if (textSelection) {
+            event.preventDefault();
+            const selection = window.getSelection();
+            if (selection) {
+              selection.removeAllRanges();
+            }
+            setTextSelection(null);
+          }
+          break;
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [polygonPoints, lassoPath, textSelection]);
+
+  // Close text selection popup on click outside
   useEffect(() => {
     if (!textSelection) return;
 
@@ -157,25 +230,8 @@ export const PDFViewer: React.FC = () => {
       }
     };
 
-    const handleEscapeKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        // Clear browser selection when closing popup
-        const selection = window.getSelection();
-        if (selection) {
-          selection.removeAllRanges();
-        }
-        setTextSelection(null);
-      }
-    };
-
     document.addEventListener('mousedown', handleClickOutside);
-    document.addEventListener('keydown', handleEscapeKey);
-
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-      document.removeEventListener('keydown', handleEscapeKey);
-    };
+    return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [textSelection]);
 
   const onDocumentLoadSuccess = () => {
@@ -369,6 +425,116 @@ export const PDFViewer: React.FC = () => {
       });
     }
 
+    // Draw lasso path
+    if (lassoPath.length > 1) {
+      // Show selected blocks in real-time for lasso mode
+      if (lassoPath.length > 10 && currentPageData) {
+        const closedPath = closePolygon(lassoPath, 20);
+        const selectedBlocks = currentPageData.blocks.filter((block) =>
+          bboxIntersectsPolygon(block.bbox, closedPath)
+        );
+
+        // Draw selected blocks
+        selectedBlocks.forEach((block) => {
+          const x = block.bbox.x0 * effectiveScale;
+          const y = block.bbox.y0 * effectiveScale;
+          const width = (block.bbox.x1 - block.bbox.x0) * effectiveScale;
+          const height = (block.bbox.y1 - block.bbox.y0) * effectiveScale;
+
+          ctx.fillStyle = 'rgba(255, 152, 0, 0.25)';
+          ctx.fillRect(x, y, width, height);
+
+          ctx.strokeStyle = '#ff9800';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(x, y, width, height);
+        });
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(lassoPath[0].x * effectiveScale, lassoPath[0].y * effectiveScale);
+      for (let i = 1; i < lassoPath.length; i++) {
+        ctx.lineTo(lassoPath[i].x * effectiveScale, lassoPath[i].y * effectiveScale);
+      }
+      ctx.strokeStyle = '#ff9800';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([8, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Fill semi-transparent
+      ctx.fillStyle = 'rgba(255, 152, 0, 0.1)';
+      ctx.fill();
+    }
+
+    // Draw polygon points
+    if (polygonPoints.length > 0) {
+      // Show selected blocks in real-time for polygon mode
+      if (polygonPoints.length >= 3 && currentPageData) {
+        const closedPolygon = closePolygon(polygonPoints, 20);
+        const selectedBlocks = currentPageData.blocks.filter((block) =>
+          bboxIntersectsPolygon(block.bbox, closedPolygon)
+        );
+
+        // Draw selected blocks
+        selectedBlocks.forEach((block) => {
+          const x = block.bbox.x0 * effectiveScale;
+          const y = block.bbox.y0 * effectiveScale;
+          const width = (block.bbox.x1 - block.bbox.x0) * effectiveScale;
+          const height = (block.bbox.y1 - block.bbox.y0) * effectiveScale;
+
+          ctx.fillStyle = 'rgba(156, 39, 176, 0.25)';
+          ctx.fillRect(x, y, width, height);
+
+          ctx.strokeStyle = '#9c27b0';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(x, y, width, height);
+        });
+      }
+
+      // Draw lines between points
+      if (polygonPoints.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(polygonPoints[0].x * effectiveScale, polygonPoints[0].y * effectiveScale);
+        for (let i = 1; i < polygonPoints.length; i++) {
+          ctx.lineTo(polygonPoints[i].x * effectiveScale, polygonPoints[i].y * effectiveScale);
+        }
+        ctx.strokeStyle = '#9c27b0';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+
+        // Show fill preview
+        ctx.fillStyle = 'rgba(156, 39, 176, 0.1)';
+        ctx.fill();
+      }
+
+      // Draw points as circles
+      polygonPoints.forEach((point, index) => {
+        ctx.beginPath();
+        ctx.arc(point.x * effectiveScale, point.y * effectiveScale, 6, 0, 2 * Math.PI);
+        ctx.fillStyle = index === 0 ? '#e91e63' : '#9c27b0'; // First point is different color
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      });
+
+      // Show distance to start point for closing
+      if (polygonPoints.length > 2 && currentMousePos) {
+        const distToStart = Math.sqrt(
+          Math.pow(currentMousePos.x - polygonPoints[0].x, 2) +
+            Math.pow(currentMousePos.y - polygonPoints[0].y, 2)
+        );
+        if (distToStart < 15) {
+          // Highlight start point
+          ctx.beginPath();
+          ctx.arc(polygonPoints[0].x * effectiveScale, polygonPoints[0].y * effectiveScale, 12, 0, 2 * Math.PI);
+          ctx.strokeStyle = '#4caf50';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+      }
+    }
+
     // Draw current selection (after mouse up) - ONLY for canvas selections, not text layer
     // Text layer selections show native browser highlight, don't need canvas highlight
     if (textSelection && textSelection.pageNumber === currentPage && textSelection.stats) {
@@ -385,7 +551,7 @@ export const PDFViewer: React.FC = () => {
       ctx.lineWidth = 3;
       ctx.strokeRect(x, y, width, height);
     }
-  }, [currentPageData, effectiveScale, annotations, searchResults, currentSearchIndex, selectedAnnotation, textSelection, currentPage, hoveredBlocks, isSelecting, selectionStart, currentMousePos, liveSelectedBlocks, zoomLevel, flashingAnnotationId]);
+  }, [currentPageData, effectiveScale, annotations, searchResults, currentSearchIndex, selectedAnnotation, textSelection, currentPage, hoveredBlocks, isSelecting, selectionStart, currentMousePos, liveSelectedBlocks, zoomLevel, flashingAnnotationId, lassoPath, polygonPoints]);
 
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -395,6 +561,42 @@ export const PDFViewer: React.FC = () => {
     const x = (e.clientX - rect.left) / effectiveScale;
     const y = (e.clientY - rect.top) / effectiveScale;
 
+    if (selectionTool === 'polygon') {
+      // Polygon mode: Add point on click
+      const newPoint = { x, y };
+      setPolygonPoints([...polygonPoints, newPoint]);
+
+      // Double-click or click near start to close polygon
+      if (polygonPoints.length > 2) {
+        const distToStart = Math.sqrt(
+          Math.pow(x - polygonPoints[0].x, 2) + Math.pow(y - polygonPoints[0].y, 2)
+        );
+        if (distToStart < 15) {
+          // Close polygon and select
+          handlePolygonSelection(polygonPoints);
+          setPolygonPoints([]);
+        }
+      }
+      return;
+    }
+
+    if (selectionTool === 'lasso') {
+      // Lasso mode: Start drawing
+      setLassoPath([{ x, y }]);
+      setIsSelecting(true);
+      setTextSelection(null);
+      return;
+    }
+
+    if (selectionTool === 'add-text') {
+      // Add text mode: Start drawing bounding box
+      setIsSelecting(true);
+      setSelectionStart({ x, y });
+      setCurrentMousePos({ x, y });
+      return;
+    }
+
+    // Rectangle mode
     // Detect selection mode from modifier keys
     if (e.shiftKey) {
       setSelectionMode('line'); // Line mode
@@ -423,7 +625,14 @@ export const PDFViewer: React.FC = () => {
 
     setCurrentMousePos({ x, y });
 
-    if (isSelecting && selectionStart) {
+    // Lasso mode: Add points to path
+    if (isSelecting && selectionTool === 'lasso' && lassoPath.length > 0) {
+      const newPath = [...lassoPath, { x, y }];
+      setLassoPath(newPath);
+      return;
+    }
+
+    if (isSelecting && selectionStart && selectionTool === 'rectangle') {
       // Calculate selection rectangle
       const selRect: SelectionRect = {
         left: Math.min(selectionStart.x, x),
@@ -469,7 +678,87 @@ export const PDFViewer: React.FC = () => {
     }
   };
 
+  // Handle polygon selection completion
+  const handlePolygonSelection = (polygon: Point[]) => {
+    if (!currentPageData || polygon.length < 3) return;
+
+    const closedPolygon = closePolygon(polygon);
+
+    // Find blocks inside polygon
+    let selectedBlocks = currentPageData.blocks.filter((block) =>
+      bboxIntersectsPolygon(block.bbox, closedPolygon)
+    );
+
+    selectedBlocks = filterTextBlocks(selectedBlocks);
+
+    if (selectedBlocks.length > 0) {
+      const smartResult = smartTextSelection(selectedBlocks, {
+        detectColumns: true,
+        respectReadingOrder: true,
+        smartSpacing: true,
+      });
+
+      const sortedBlocks = smartResult.blocks;
+      const combinedText = smartResult.text;
+
+      const minX = Math.min(...sortedBlocks.map((b) => b.bbox.x0));
+      const minY = Math.min(...sortedBlocks.map((b) => b.bbox.y0));
+      const maxX = Math.max(...sortedBlocks.map((b) => b.bbox.x1));
+      const maxY = Math.max(...sortedBlocks.map((b) => b.bbox.y1));
+
+      const stats = getSelectionStatistics(sortedBlocks, combinedText);
+
+      setTextSelection({
+        text: combinedText,
+        bbox: { x0: minX, y0: minY, x1: maxX, y1: maxY },
+        pageNumber: currentPage,
+        stats,
+      });
+    }
+  };
+
   const handleCanvasMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Lasso mode: Complete selection
+    if (isSelecting && selectionTool === 'lasso' && lassoPath.length > 10) {
+      const simplifiedPath = simplifyPath(lassoPath, 3);
+      handlePolygonSelection(simplifiedPath);
+      setLassoPath([]);
+      setIsSelecting(false);
+      setLiveSelectedBlocks([]);
+      return;
+    }
+
+    // Add text mode: Open modal with drawn bounding box
+    if (isSelecting && selectionTool === 'add-text' && selectionStart) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / effectiveScale;
+      const y = (e.clientY - rect.top) / effectiveScale;
+
+      const bbox = {
+        x0: Math.min(selectionStart.x, x),
+        y0: Math.min(selectionStart.y, y),
+        x1: Math.max(selectionStart.x, x),
+        y1: Math.max(selectionStart.y, y),
+      };
+
+      // Check minimum size
+      const width = bbox.x1 - bbox.x0;
+      const height = bbox.y1 - bbox.y0;
+
+      if (width > 5 && height > 5) {
+        setAddTextBbox(bbox);
+        setIsAddTextModalOpen(true);
+      }
+
+      setIsSelecting(false);
+      setSelectionStart(null);
+      setCurrentMousePos(null);
+      return;
+    }
+
     if (!isSelecting || !selectionStart || !currentPageData || !spatialIndex) return;
 
     const canvas = canvasRef.current;
@@ -513,20 +802,29 @@ export const PDFViewer: React.FC = () => {
     // Remove overlapping blocks (keep highest confidence)
     selectedBlocks = resolveOverlappingBlocks(selectedBlocks);
 
-    // Filter out empty/invalid blocks
-    selectedBlocks = filterValidBlocks(selectedBlocks);
+    // Filter out empty/invalid blocks and decorative elements
+    selectedBlocks = filterTextBlocks(selectedBlocks);
 
     if (selectedBlocks.length > 0) {
-      // Sort in reading order (handles multi-column layouts)
-      const sortedBlocks = sortBlocksInReadingOrder(selectedBlocks);
+      // Use smart selection engine for intelligent text grouping
+      const smartResult = smartTextSelection(selectedBlocks, {
+        detectColumns: true,
+        respectReadingOrder: true,
+        smartSpacing: true,
+      });
 
-      // Extract text with mode awareness
-      const textParts = sortedBlocks.map((block) =>
-        extractTextFromBlock(block, selRect, selectionMode)
-      );
+      const sortedBlocks = smartResult.blocks;
+      const combinedText = smartResult.text;
 
-      // Combine text with proper whitespace
-      const combinedText = normalizeWhitespace(textParts.join(' '));
+      // DEBUG: Check if text has spaces
+      console.log('[CANVAS SELECTION] Combined text:', combinedText);
+      console.log('[CANVAS SELECTION] Has spaces?', combinedText.includes(' '));
+      console.log('[CANVAS SELECTION] First 100 chars:', combinedText.substring(0, 100));
+
+      // Log column detection for debugging
+      if (smartResult.columns.length > 1) {
+        console.log(`Smart Selection: Detected ${smartResult.columns.length} columns`);
+      }
 
       // Calculate bounding box for all selected blocks
       const minX = Math.min(...sortedBlocks.map((b) => b.bbox.x0));
@@ -551,8 +849,8 @@ export const PDFViewer: React.FC = () => {
         return;
       }
 
-      // Get statistics
-      const stats = getSelectionStats(sortedBlocks, combinedText);
+      // Get statistics using smart engine
+      const stats = getSelectionStatistics(sortedBlocks, combinedText);
 
       setTextSelection({
         text: combinedText,
@@ -585,6 +883,30 @@ export const PDFViewer: React.FC = () => {
     });
   };
 
+  // Handler for manual text addition
+  const handleAddTextSave = (text: string) => {
+    if (!addTextBbox) return;
+
+    // Create annotation directly with manually entered text
+    const event = new CustomEvent('createAnnotation', {
+      detail: {
+        text,
+        bbox: addTextBbox,
+        pageNumber: currentPage,
+      },
+    });
+    window.dispatchEvent(event);
+
+    // Close modal and reset
+    setIsAddTextModalOpen(false);
+    setAddTextBbox(null);
+  };
+
+  const handleAddTextCancel = () => {
+    setIsAddTextModalOpen(false);
+    setAddTextBbox(null);
+  };
+
   // Text-only view mode
   if (viewMode === 'text-only') {
     if (!currentPageData) {
@@ -605,6 +927,16 @@ export const PDFViewer: React.FC = () => {
   // PDF view mode (with optional text layer overlay)
   return (
     <div className="pdf-viewer-container" ref={containerRef}>
+      {/* Selection Toolbar */}
+      <SelectionToolbar
+        currentTool={selectionTool}
+        onToolChange={(tool) => {
+          setSelectionTool(tool);
+          setPolygonPoints([]);
+          setLassoPath([]);
+        }}
+      />
+
       <div className="pdf-viewer-content">
         <Document
           file={fileUrl}
@@ -645,8 +977,17 @@ export const PDFViewer: React.FC = () => {
                 position: 'absolute',
                 top: 0,
                 left: 0,
-                cursor: isSelecting ? 'crosshair' : hoveredBlocks.length > 0 ? 'pointer' : 'text',
-                pointerEvents: isSelecting ? 'all' : 'none', // Allow text layer to handle selection when not actively selecting
+                cursor:
+                  selectionTool === 'lasso' ? 'crosshair' :
+                  selectionTool === 'polygon' ? 'crosshair' :
+                  selectionTool === 'add-text' ? 'crosshair' :
+                  isSelecting ? 'crosshair' :
+                  hoveredBlocks.length > 0 ? 'pointer' : 'text',
+                // Allow canvas events for lasso/polygon/add-text tools, otherwise let text layer handle
+                pointerEvents:
+                  selectionTool === 'lasso' || selectionTool === 'polygon' || selectionTool === 'add-text' || isSelecting
+                    ? 'all'
+                    : 'none',
               }}
             />
           </div>
@@ -729,6 +1070,17 @@ export const PDFViewer: React.FC = () => {
               </button>
             </div>
           </div>
+        )}
+
+        {/* Add Text Modal */}
+        {addTextBbox && (
+          <AddTextModal
+            isOpen={isAddTextModalOpen}
+            bbox={addTextBbox}
+            pageNumber={currentPage}
+            onSave={handleAddTextSave}
+            onCancel={handleAddTextCancel}
+          />
         )}
       </div>
     </div>

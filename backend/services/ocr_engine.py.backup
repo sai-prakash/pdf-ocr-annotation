@@ -1,0 +1,337 @@
+import pytesseract
+import easyocr
+import numpy as np
+from PIL import Image
+from typing import List, Dict, Tuple, Optional
+import logging
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+class OCREngine(Enum):
+    """Available OCR engines"""
+    PYTESSERACT = "pytesseract"
+    EASYOCR = "easyocr"
+    AUTO = "auto"  # Intelligent selection
+
+
+class HybridOCRProcessor:
+    """
+    Hybrid OCR system using Pytesseract (primary) and EasyOCR (fallback)
+    
+    Strategy:
+    1. Try Pytesseract first (fast, accurate for clean docs)
+    2. Fall back to EasyOCR if Pytesseract confidence is low
+    3. Use intelligent engine selection based on document characteristics
+    """
+    
+    def __init__(self, tesseract_path: Optional[str] = None):
+        """
+        Initialize hybrid OCR processor
+        
+        Args:
+            tesseract_path: Path to tesseract executable (optional)
+        """
+        self.tesseract_available = self._check_tesseract(tesseract_path)
+        self.easyocr_reader = None  # Lazy load
+        
+        logger.info(f"[OCR] Hybrid OCR initialized - Tesseract: {self.tesseract_available}")
+    
+    def _check_tesseract(self, tesseract_path: Optional[str] = None) -> bool:
+        """Check if Pytesseract is available"""
+        try:
+            if tesseract_path:
+                pytesseract.pytesseract.tesseract_cmd = tesseract_path
+            
+            # Test run
+            pytesseract.get_tesseract_version()
+            logger.info(f"[OCR] Pytesseract version: {pytesseract.get_tesseract_version()}")
+            return True
+        except Exception as e:
+            logger.warning(f"[OCR] Pytesseract not available: {e}")
+            return False
+    
+    def _get_easyocr_reader(self):
+        """Lazy load EasyOCR reader"""
+        if self.easyocr_reader is None:
+            logger.info("[OCR] Loading EasyOCR reader...")
+            self.easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        return self.easyocr_reader
+    
+    def _calculate_confidence(self, data: Dict) -> float:
+        """Calculate average confidence from Pytesseract results"""
+        confidences = [float(conf) for conf in data['conf'] if conf != '-1']
+        return np.mean(confidences) / 100.0 if confidences else 0.0
+    
+    def _is_good_quality(self, image: np.ndarray) -> bool:
+        """
+        Detect if image is good quality (suitable for Pytesseract)
+        
+        Checks:
+        - Contrast
+        - Sharpness
+        - Noise level
+        """
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = np.mean(image, axis=2).astype(np.uint8)
+        else:
+            gray = image
+        
+        # Check contrast (standard deviation)
+        contrast = np.std(gray)
+        
+        # Check sharpness (Laplacian variance)
+        laplacian = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
+        edges = np.abs(np.convolve(gray.flatten(), laplacian.flatten(), mode='same'))
+        sharpness = np.var(edges)
+        
+        # Good quality thresholds
+        is_good = contrast > 40 and sharpness > 100
+        
+        logger.info(f"[OCR] Image quality - Contrast: {contrast:.1f}, Sharpness: {sharpness:.1f}, Good: {is_good}")
+        return is_good
+    
+    def extract_text_pytesseract(
+        self,
+        image: np.ndarray,
+        page_width: float,
+        page_height: float
+    ) -> Tuple[List[Dict], float]:
+        """
+        Extract text using Pytesseract
+        
+        Returns:
+            (blocks, avg_confidence)
+        """
+        start_time = time.time()
+        
+        # Convert numpy array to PIL Image
+        if isinstance(image, np.ndarray):
+            pil_image = Image.fromarray(image)
+        else:
+            pil_image = image
+        
+        # Get detailed data with bounding boxes
+        data = pytesseract.image_to_data(
+            pil_image,
+            output_type=pytesseract.Output.DICT,
+            config='--psm 6 --oem 3'  # PSM 6: uniform block, OEM 3: default
+        )
+        
+        blocks = []
+        img_height, img_width = image.shape[:2]
+        
+        # Calculate scale factors
+        scale_x = page_width / img_width
+        scale_y = page_height / img_height
+        
+        # Process each word
+        n_boxes = len(data['text'])
+        for i in range(n_boxes):
+            text = data['text'][i].strip()
+            conf = float(data['conf'][i])
+            
+            # Filter low confidence and empty text
+            if conf < 30 or not text:  # 30% confidence threshold
+                continue
+            
+            # Get bounding box
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            
+            # Convert to PDF coordinates
+            x0 = x * scale_x
+            y0 = y * scale_y
+            x1 = (x + w) * scale_x
+            y1 = (y + h) * scale_y
+            
+            blocks.append({
+                "text": text,
+                "bbox": {
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                },
+                "confidence": conf / 100.0,  # Normalize to 0-1
+                "type": "ocr",
+                "engine": "pytesseract"
+            })
+        
+        avg_confidence = self._calculate_confidence(data)
+        elapsed = time.time() - start_time
+        
+        logger.info(
+            f"[OCR] Pytesseract completed in {elapsed:.2f}s, "
+            f"{len(blocks)} blocks, avg confidence: {avg_confidence:.2f}"
+        )
+        
+        return blocks, avg_confidence
+    
+    def extract_text_easyocr(
+        self,
+        image: np.ndarray,
+        page_width: float,
+        page_height: float
+    ) -> Tuple[List[Dict], float]:
+        """
+        Extract text using EasyOCR (fallback)
+        
+        Returns:
+            (blocks, avg_confidence)
+        """
+        start_time = time.time()
+        
+        reader = self._get_easyocr_reader()
+        
+        # Run EasyOCR
+        results = reader.readtext(
+            image,
+            paragraph=False,
+            decoder='beamsearch',
+            beamWidth=5,
+            width_ths=0.7,
+            height_ths=0.5,
+            batch_size=1
+        )
+        
+        blocks = []
+        img_height, img_width = image.shape[:2]
+        
+        scale_x = page_width / img_width
+        scale_y = page_height / img_height
+        
+        for detection in results:
+            bbox_points = detection[0]
+            text = detection[1]
+            confidence = detection[2]
+            
+            if confidence < 0.2 or not text.strip():
+                continue
+            
+            # Convert bbox
+            x_coords = [p[0] for p in bbox_points]
+            y_coords = [p[1] for p in bbox_points]
+            
+            x0 = min(x_coords) * scale_x
+            y0 = min(y_coords) * scale_y
+            x1 = max(x_coords) * scale_x
+            y1 = max(y_coords) * scale_y
+            
+            blocks.append({
+                "text": text,
+                "bbox": {
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                },
+                "confidence": confidence,
+                "type": "ocr",
+                "engine": "easyocr"
+            })
+        
+        avg_confidence = np.mean([b['confidence'] for b in blocks]) if blocks else 0.0
+        elapsed = time.time() - start_time
+        
+        logger.info(
+            f"[OCR] EasyOCR completed in {elapsed:.2f}s, "
+            f"{len(blocks)} blocks, avg confidence: {avg_confidence:.2f}"
+        )
+        
+        return blocks, avg_confidence
+    
+    def extract_text_auto(
+        self,
+        image: np.ndarray,
+        page_width: float,
+        page_height: float,
+        confidence_threshold: float = 0.75
+    ) -> List[Dict]:
+        """
+        Intelligent OCR with automatic engine selection
+        
+        Strategy:
+        1. Check image quality
+        2. Try Pytesseract first if available and quality is good
+        3. Fall back to EasyOCR if:
+           - Pytesseract not available
+           - Low confidence (<75%)
+           - Poor image quality
+        
+        Args:
+            image: Preprocessed image
+            page_width: PDF page width
+            page_height: PDF page height
+            confidence_threshold: Minimum confidence to accept Pytesseract results
+        
+        Returns:
+            List of text blocks with bounding boxes
+        """
+        logger.info("[OCR] Starting auto OCR with intelligent engine selection...")
+        
+        # Check image quality
+        is_good_quality = self._is_good_quality(image)
+        
+        # Try Pytesseract first if available and quality is good
+        if self.tesseract_available and is_good_quality:
+            logger.info("[OCR] Using Pytesseract (good quality detected)")
+            blocks_tess, conf_tess = self.extract_text_pytesseract(image, page_width, page_height)
+            
+            # Check if results are acceptable
+            if conf_tess >= confidence_threshold and len(blocks_tess) > 0:
+                logger.info(f"[OCR] Pytesseract success - confidence: {conf_tess:.2f}")
+                return blocks_tess
+            else:
+                logger.warning(
+                    f"[OCR] Pytesseract low confidence ({conf_tess:.2f}), "
+                    f"falling back to EasyOCR"
+                )
+        elif not self.tesseract_available:
+            logger.info("[OCR] Pytesseract not available, using EasyOCR")
+        else:
+            logger.info("[OCR] Poor image quality detected, using EasyOCR")
+        
+        # Fallback to EasyOCR
+        blocks_easy, conf_easy = self.extract_text_easyocr(image, page_width, page_height)
+        logger.info(f"[OCR] EasyOCR result - confidence: {conf_easy:.2f}")
+        
+        return blocks_easy
+    
+    def extract_text(
+        self,
+        image: np.ndarray,
+        page_width: float,
+        page_height: float,
+        engine: OCREngine = OCREngine.AUTO
+    ) -> List[Dict]:
+        """
+        Main OCR extraction method
+        
+        Args:
+            image: Preprocessed image (numpy array)
+            page_width: PDF page width
+            page_height: PDF page height
+            engine: OCR engine to use (AUTO, PYTESSERACT, EASYOCR)
+        
+        Returns:
+            List of text blocks with bounding boxes
+        """
+        if engine == OCREngine.AUTO:
+            return self.extract_text_auto(image, page_width, page_height)
+        elif engine == OCREngine.PYTESSERACT:
+            if not self.tesseract_available:
+                logger.warning("[OCR] Pytesseract requested but not available, using EasyOCR")
+                blocks, _ = self.extract_text_easyocr(image, page_width, page_height)
+                return blocks
+            blocks, _ = self.extract_text_pytesseract(image, page_width, page_height)
+            return blocks
+        elif engine == OCREngine.EASYOCR:
+            blocks, _ = self.extract_text_easyocr(image, page_width, page_height)
+            return blocks
+        else:
+            raise ValueError(f"Unknown OCR engine: {engine}")
+
+
+import time

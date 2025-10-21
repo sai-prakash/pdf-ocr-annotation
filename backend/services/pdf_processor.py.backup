@@ -1,5 +1,5 @@
 import fitz  # PyMuPDF
-import pytesseract
+import easyocr
 import numpy as np
 from PIL import Image
 import io
@@ -12,16 +12,27 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import cv2
 import re
-from services.image_preprocessor import ImagePreprocessor
 
 logger = logging.getLogger(__name__)
 
 
 class PDFProcessor:
     def __init__(self):
-        self.preprocessor = ImagePreprocessor()
+        self.reader = None  # Lazy load EasyOCR
         self.data_dir = Path("data")
         self.data_dir.mkdir(exist_ok=True)
+
+    def _get_ocr_reader(self):
+        """Lazy load EasyOCR reader with optimized settings"""
+        if self.reader is None:
+            logger.info("[OCR] Initializing EasyOCR reader...")
+            self.reader = easyocr.Reader(
+                ['en'],
+                gpu=False,  # Set to True if GPU available
+                verbose=False
+            )
+            logger.info("[OCR] EasyOCR reader initialized")
+        return self.reader
 
     def _generate_pdf_id(self, file_path: str) -> str:
         """Generate unique ID for PDF"""
@@ -98,72 +109,59 @@ class PDFProcessor:
 
     def _extract_text_ocr(self, page: fitz.Page, page_num: int = 0) -> List[Dict]:
         """
-        Extract text from scanned page using Tesseract with preprocessing
+        SIMPLIFIED: Extract text from scanned page using EasyOCR with minimal optimization
         """
         start_time = time.time()
 
-        # Convert to image at 300 DPI (optimal for Tesseract)
-        logger.info(f"[OCR] Page {page_num + 1}: Converting to image at 300 DPI...")
-        zoom = 300 / 72  # PDF default is 72 DPI, so 300/72 = 4.17x
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        # Convert to image at 2.0x resolution (better for EasyOCR)
+        logger.info(f"[OCR] Page {page_num + 1}: Converting to image at 2.0x resolution...")
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
 
         # Convert to numpy array
         img_data = pix.tobytes("png")
         image = Image.open(io.BytesIO(img_data))
         img_array = np.array(image)
 
-        logger.info(f"[OCR] Page {page_num + 1}: Light preprocessing...")
+        logger.info(f"[OCR] Page {page_num + 1}: Image size {img_array.shape}, starting OCR...")
 
-        # LIGHT preprocessing - don't destroy image quality
-        # Convert to grayscale only
-        if len(img_array.shape) == 3:
-            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img_array
+        # Get OCR reader
+        reader = self._get_ocr_reader()
 
-        # Optional: Very light contrast enhancement (helps faded text)
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        preprocessed = clahe.apply(gray)
-
-        logger.info(f"[OCR] Page {page_num + 1}: Running Tesseract OCR...")
-
-        # Get detailed data with bounding boxes
-        # PSM 3 = automatic page segmentation (better word detection)
-        # OEM 1 = LSTM neural net only
-        # preserve_interword_spaces = keep spaces between words
-        data = pytesseract.image_to_data(
-            preprocessed,
-            output_type=pytesseract.Output.DICT,
-            config='--oem 1 --psm 3 -c preserve_interword_spaces=1'
+        # Run EasyOCR with optimized parameters
+        results = reader.readtext(
+            img_array,
+            paragraph=False,
+            batch_size=1
         )
 
-        # Extract text blocks with bounding boxes
+        logger.info(f"[OCR] Page {page_num + 1}: Found {len(results)} text blocks")
+
+        # Process results
         blocks = []
         page_height = page.rect.height
         page_width = page.rect.width
 
-        # Calculate scale factor (back to PDF coordinates)
+        # Calculate scale factor
         scale_x = page_width / pix.width
         scale_y = page_height / pix.height
 
-        # Process each word
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            text = data['text'][i].strip()
-            conf = int(data['conf'][i])
+        for detection in results:
+            bbox_points = detection[0]
+            text = detection[1]
+            confidence = detection[2]
 
-            # Filter low-confidence and empty results
-            if conf < 0 or not text:  # Accept all confidence levels (Tesseract uses -1 for unrecognized)
+            # Only filter extremely low confidence
+            if confidence < 0.2 or not text.strip():
                 continue
 
-            # Get bounding box coordinates
-            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            # Convert bbox to x0, y0, x1, y1 format
+            x_coords = [p[0] for p in bbox_points]
+            y_coords = [p[1] for p in bbox_points]
 
-            # Convert to PDF coordinate system
-            x0 = x * scale_x
-            y0 = y * scale_y
-            x1 = (x + w) * scale_x
-            y1 = (y + h) * scale_y
+            x0 = min(x_coords) * scale_x
+            y0 = min(y_coords) * scale_y
+            x1 = max(x_coords) * scale_x
+            y1 = max(y_coords) * scale_y
 
             blocks.append({
                 "text": text,
@@ -173,7 +171,7 @@ class PDFProcessor:
                     "x1": x1,
                     "y1": y1,
                 },
-                "confidence": conf / 100.0,  # Convert to 0-1 range
+                "confidence": confidence,
                 "type": "ocr"
             })
 
@@ -182,7 +180,7 @@ class PDFProcessor:
 
         logger.info(
             f"[OCR] Page {page_num + 1}: Completed in {total_time:.2f}s, "
-            f"{len(blocks)} blocks, avg confidence: {avg_confidence:.2%}"
+            f"{len(blocks)} blocks, avg confidence: {avg_confidence:.2f}"
         )
 
         return blocks

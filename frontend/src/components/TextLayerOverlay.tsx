@@ -39,51 +39,36 @@ export const TextLayerOverlay: React.FC<TextLayerOverlayProps> = ({
     return map;
   }, [blocks]);
 
-  // Advanced font size calculation with character width analysis
+  // Improved font size calculation for pixel-perfect alignment
   const calculateAdvancedMetrics = useMemo(() => {
     return (block: TextBlock) => {
       const width = (block.bbox.x1 - block.bbox.x0) * scale;
       const height = (block.bbox.y1 - block.bbox.y0) * scale;
       const textLength = block.text.length;
 
-      // Calculate ideal font size using binary search for precision
-      let minSize = 1;
-      let maxSize = height * 1.2;
-      let optimalSize = height * 0.75;
+      // More accurate font size calculation
+      // Start with height-based size
+      let fontSize = height * 0.85; // Increased from 0.75 for better fill
 
-      // Estimate average character width
-      const avgCharWidth = width / textLength;
+      // Calculate expected width with this font size
+      // Average character width is approximately 0.55 * fontSize for Arial
+      const avgCharWidth = fontSize * 0.55;
+      const expectedWidth = avgCharWidth * textLength;
 
-      // Font size calculation based on character density
-      // Higher density = smaller font to fit
-      const densityFactor = Math.min(1, avgCharWidth / (height * 0.6));
-      optimalSize = height * 0.75 * Math.max(0.7, densityFactor);
-
-      // Letter spacing calculation
-      // If text is wider than expected, add letter spacing
-      const expectedWidth = optimalSize * 0.6 * textLength;
+      // Adjust letter spacing to make text fit exactly
       let letterSpacing = 0;
-
-      if (width > expectedWidth) {
-        letterSpacing = (width - expectedWidth) / Math.max(1, textLength - 1);
+      if (textLength > 1) {
+        letterSpacing = (width - expectedWidth) / (textLength - 1);
       }
 
-      // Word spacing for multi-word blocks
-      const words = block.text.split(' ');
-      let wordSpacing = 0;
-
-      if (words.length > 1) {
-        const totalChars = block.text.replace(/\s/g, '').length;
-        const charWidth = optimalSize * 0.6;
-        const usedWidth = totalChars * charWidth;
-        const remainingSpace = width - usedWidth;
-        wordSpacing = remainingSpace / (words.length - 1);
-      }
+      // Clamp values for stability
+      fontSize = Math.max(6, Math.min(120, fontSize));
+      letterSpacing = Math.max(-2, Math.min(10, letterSpacing));
 
       return {
-        fontSize: Math.max(8, Math.min(100, optimalSize)),
-        letterSpacing: Math.max(0, Math.min(5, letterSpacing)),
-        wordSpacing: Math.max(0, Math.min(20, wordSpacing)),
+        fontSize,
+        letterSpacing,
+        wordSpacing: 0, // Not needed for individual words
         lineHeight: height,
       };
     };
@@ -256,6 +241,36 @@ export const TextLayerOverlay: React.FC<TextLayerOverlayProps> = ({
     }
   }, [nativeSelection, onTextSelect]);
 
+  // Group blocks by line for proper spacing
+  const groupedByLine = useMemo(() => {
+    type StyledBlock = typeof styledBlocks[0];
+    const lines: StyledBlock[][] = [];
+    let currentLine: StyledBlock[] = [];
+    let lastY = -1;
+
+    styledBlocks.forEach((block) => {
+      const blockY = block.y;
+
+      // Check if on same line (within 5px tolerance)
+      if (lastY === -1 || Math.abs(blockY - lastY) <= 5) {
+        currentLine.push(block);
+        lastY = blockY;
+      } else {
+        if (currentLine.length > 0) {
+          lines.push(currentLine);
+        }
+        currentLine = [block];
+        lastY = blockY;
+      }
+    });
+
+    if (currentLine.length > 0) {
+      lines.push(currentLine);
+    }
+
+    return lines;
+  }, [styledBlocks]);
+
   return (
     <div
       ref={containerRef}
@@ -270,46 +285,60 @@ export const TextLayerOverlay: React.FC<TextLayerOverlayProps> = ({
         zIndex: 10,
       }}
     >
-      {styledBlocks.map(({ index, block, x, y, width, height, metrics }) => (
-        <div
-          key={index}
-          className="text-block-overlay"
-          data-block-index={index}
-          style={{
-            position: 'absolute',
-            left: `${x}px`,
-            top: `${y}px`,
-            width: `${width}px`,
-            height: `${height}px`,
-            fontSize: `${metrics.fontSize}px`,
-            lineHeight: `${metrics.lineHeight}px`,
-            letterSpacing: `${metrics.letterSpacing}px`,
-            wordSpacing: `${metrics.wordSpacing}px`,
-            color: 'transparent',
-            cursor: 'text',
-            userSelect: 'text',
-            WebkitUserSelect: 'text',
-            MozUserSelect: 'text',
-            msUserSelect: 'text',
-            whiteSpace: 'pre',
-            overflow: 'hidden',
-            fontFamily: 'Arial, Helvetica, sans-serif',
-            fontWeight: 'normal',
-            fontStyle: 'normal',
-            textAlign: 'left',
-            verticalAlign: 'top',
-            padding: 0,
-            margin: 0,
-            border: 'none',
-            // Anti-aliasing for better rendering
-            WebkitFontSmoothing: 'antialiased',
-            MozOsxFontSmoothing: 'grayscale',
-          }}
-          title={`Block ${index}: "${block.text}"`}
-        >
-          {block.text}
-        </div>
-      ))}
+      {styledBlocks.map(({ index, block, x, y, width, height, metrics }) => {
+        // Calculate horizontal scale to fit text exactly
+        const textContent = block.text;
+        const expectedTextWidth = metrics.fontSize * 0.55 * textContent.length +
+                                  metrics.letterSpacing * (textContent.length - 1);
+        const scaleX = width / Math.max(expectedTextWidth, 1);
+
+        return (
+          <div
+            key={index}
+            className="text-block-overlay"
+            data-block-index={index}
+            style={{
+              position: 'absolute',
+              left: `${x}px`,
+              top: `${y}px`,
+              width: `${width}px`,
+              height: `${height}px`,
+              fontSize: `${metrics.fontSize}px`,
+              lineHeight: `${height}px`,
+              letterSpacing: `${metrics.letterSpacing}px`,
+              color: 'transparent',
+              cursor: 'text',
+              userSelect: 'text',
+              WebkitUserSelect: 'text',
+              MozUserSelect: 'text',
+              msUserSelect: 'text',
+              whiteSpace: 'nowrap',
+              overflow: 'visible',
+              fontFamily: 'Arial, Helvetica, sans-serif',
+              fontWeight: 'normal',
+              fontStyle: 'normal',
+              textAlign: 'left',
+              padding: 0,
+              margin: 0,
+              border: 'none',
+              WebkitFontSmoothing: 'antialiased',
+              MozOsxFontSmoothing: 'grayscale',
+              display: 'inline-block',
+              transformOrigin: 'left top',
+              transform: `scaleX(${scaleX})`,
+            }}
+            title={`Block ${index}: "${block.text}"`}
+          >
+            {block.text}
+            {/* Add invisible space after each word for browser selection */}
+            <span style={{
+              color: 'transparent',
+              userSelect: 'text',
+              pointerEvents: 'none',
+            }}> </span>
+          </div>
+        );
+      })}
     </div>
   );
 };
