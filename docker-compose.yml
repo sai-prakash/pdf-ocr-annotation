@@ -1,0 +1,108 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:14-alpine
+    container_name: promptforge-db
+    environment:
+      POSTGRES_DB: promptforge
+      POSTGRES_USER: promptforge
+      POSTGRES_PASSWORD: promptforge_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U promptforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Server
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: promptforge-api
+    command: python main_with_pipeline.py
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://promptforge:promptforge_dev_password@postgres:5432/promptforge
+      STORAGE_BACKEND: filesystem
+      STORAGE_BASE_PATH: /app/data/storage
+      OCR_PROVIDER: tesseract
+      LLM_PROVIDER: mock
+      USE_NEW_PIPELINE: "true"
+      ENABLE_IDEMPOTENCY_CACHE: "true"
+      LOG_LEVEL: INFO
+    volumes:
+      - ./backend:/app
+      - storage_data:/app/data/storage
+      - upload_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Worker (can scale this)
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: promptforge-worker-1
+    command: python -m promptforge.workers.loop
+    environment:
+      DATABASE_URL: postgresql+asyncpg://promptforge:promptforge_dev_password@postgres:5432/promptforge
+      STORAGE_BACKEND: filesystem
+      STORAGE_BASE_PATH: /app/data/storage
+      OCR_PROVIDER: tesseract
+      LLM_PROVIDER: mock
+      WORKER_ID: worker-docker-1
+      WORKER_MAX_CONCURRENT_JOBS: 2
+      WORKER_HEARTBEAT_INTERVAL: 30
+      ENABLE_IDEMPOTENCY_CACHE: "true"
+      LOG_LEVEL: INFO
+    volumes:
+      - ./backend:/app
+      - storage_data:/app/data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Scheduler (Watchdog)
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: promptforge-scheduler
+    command: python -m promptforge.scheduler.watchdog
+    environment:
+      DATABASE_URL: postgresql+asyncpg://promptforge:promptforge_dev_password@postgres:5432/promptforge
+      WATCHDOG_INTERVAL: 60
+      WATCHDOG_STALE_THRESHOLD: 90
+      ENABLE_IDEMPOTENCY_CACHE: "true"
+      LOG_LEVEL: INFO
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Frontend (optional)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: promptforge-frontend
+  #   ports:
+  #     - "5173:5173"
+  #   depends_on:
+  #     - api
+  #   restart: unless-stopped
+
+volumes:
+  postgres_data:
+  storage_data:
+  upload_data:

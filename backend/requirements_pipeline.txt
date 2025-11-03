@@ -1,0 +1,3 @@
+# Additional requirements for PromptForge Pipeline
+asyncpg==0.29.0
+pydantic-settings==2.1.0
