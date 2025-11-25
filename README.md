@@ -84,6 +84,3 @@ Vector Integration: Pushing annotated chunks directly to Azure AI Search.
 Multi-Modal Layout Analysis: Using LayoutLM to detect tables vs. paragraphs automatically.
 
 Collaborative Sockets: Moving from REST to WebSockets for real-time collaborative annotation.
-
-### 📜 Context
-This code is a sanitized extraction from the internal "PromptForge" platform built for JPM Operations. Some proprietary business logic has been removed for demonstration purposes.
