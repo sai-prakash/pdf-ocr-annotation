@@ -66,3 +66,24 @@ source venv/bin/activate
 pip install -r requirements.txt
 python main.py
 # Server running on localhost:8000
+```
+
+### Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+# UI running on localhost:5173
+```
+
+
+
+### 🔮 Future Roadmap (Scaling to Production)
+Vector Integration: Pushing annotated chunks directly to Azure AI Search.
+
+Multi-Modal Layout Analysis: Using LayoutLM to detect tables vs. paragraphs automatically.
+
+Collaborative Sockets: Moving from REST to WebSockets for real-time collaborative annotation.
+
+### 📜 Context
+This code is a sanitized extraction from the internal "PromptForge" platform built for JPM Operations. Some proprietary business logic has been removed for demonstration purposes.
